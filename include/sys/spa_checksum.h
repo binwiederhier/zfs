@@ -47,6 +47,10 @@ typedef struct zio_cksum {
 	(zcp)->zc_word[3] = w3;			\
 }
 
+#define	ZIO_CHECKSUM_MAC_EQUAL(zc1, zc2) \
+	(0 == (((zc1).zc_word[0] - (zc2).zc_word[0]) | \
+	((zc1).zc_word[1] - (zc2).zc_word[1])))
+
 #define	ZIO_CHECKSUM_EQUAL(zc1, zc2) \
 	(0 == (((zc1).zc_word[0] - (zc2).zc_word[0]) | \
 	((zc1).zc_word[1] - (zc2).zc_word[1]) | \
@@ -64,6 +68,15 @@ typedef struct zio_cksum {
 	(zcp)->zc_word[2] = BSWAP_64((zcp)->zc_word[2]);	\
 	(zcp)->zc_word[3] = BSWAP_64((zcp)->zc_word[3]);	\
 }
+
+#define	MAX_DATA_MAC_LEN 16
+#define	MAX_DATA_IV_LEN 12
+
+#define	ZIO_SET_MAC(bp, mac)	\
+	bcopy((mac), &(bp)->blk_cksum.zc_word[2], MAX_DATA_MAC_LEN);
+
+#define	ZIO_SET_IV(bp, iv)	\
+	bcopy((iv), (bp)->blk_iv, MAX_DATA_IV_LEN);
 
 #ifdef	__cplusplus
 }

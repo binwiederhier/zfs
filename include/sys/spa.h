@@ -58,6 +58,7 @@ typedef struct zbookmark_phys zbookmark_phys_t;
 
 struct dsl_pool;
 struct dsl_dataset;
+struct dsl_crypto_params;
 
 /*
  * General-purpose 32-bit and 64-bit bitfield encodings.
@@ -196,7 +197,7 @@ typedef struct dva {
  * G		gang block indicator
  * B		byteorder (endianness)
  * D		dedup
- * X		encryption (on version 30, which is not supported)
+ * X		encryption
  * E		blkptr_t contains embedded data (see below)
  * lvl		level of indirection
  * type		DMU object type
@@ -242,7 +243,7 @@ typedef struct dva {
  * payload		contains the embedded data
  * B (byteorder)	byteorder (endianness)
  * D (dedup)		padding (set to zero)
- * X			encryption (set to zero; see above)
+ * X			encryption (set to zero)
  * E (embedded)		set to one
  * lvl			indirection level
  * type			DMU object type
@@ -314,7 +315,7 @@ typedef enum bp_embedded_type {
 typedef struct blkptr {
 	dva_t		blk_dva[SPA_DVAS_PER_BP]; /* Data Virtual Addresses */
 	uint64_t	blk_prop;	/* size, compression, type, etc	    */
-	uint64_t	blk_pad[2];	/* Extra space for the future	    */
+	uint64_t	blk_iv[2];	/* 96 bit IV for encryption	    */
 	uint64_t	blk_phys_birth;	/* txg when block was allocated	    */
 	uint64_t	blk_birth;	/* transaction group at birth	    */
 	uint64_t	blk_fill;	/* fill count			    */
@@ -382,6 +383,9 @@ _NOTE(CONSTCOND) } while (0)
 
 #define	BP_GET_LEVEL(bp)		BF64_GET((bp)->blk_prop, 56, 5)
 #define	BP_SET_LEVEL(bp, x)		BF64_SET((bp)->blk_prop, 56, 5, x)
+
+#define	BP_IS_ENCRYPTED(bp)		BF64_GET((bp)->blk_prop, 61, 1)
+#define	BP_SET_ENCRYPTED(bp, x)		BF64_SET((bp)->blk_prop, 61, 1, x)
 
 #define	BP_GET_DEDUP(bp)		BF64_GET((bp)->blk_prop, 62, 1)
 #define	BP_SET_DEDUP(bp, x)		BF64_SET((bp)->blk_prop, 62, 1, x)
@@ -459,8 +463,8 @@ _NOTE(CONSTCOND) } while (0)
 	(bp)->blk_dva[2].dva_word[0] = 0;	\
 	(bp)->blk_dva[2].dva_word[1] = 0;	\
 	(bp)->blk_prop = 0;			\
-	(bp)->blk_pad[0] = 0;			\
-	(bp)->blk_pad[1] = 0;			\
+	(bp)->blk_iv[0] = 0;			\
+	(bp)->blk_iv[1] = 0;			\
 	(bp)->blk_phys_birth = 0;		\
 	(bp)->blk_birth = 0;			\
 	(bp)->blk_fill = 0;			\
@@ -571,8 +575,8 @@ extern int spa_open_rewind(const char *pool, spa_t **, void *tag,
     nvlist_t *policy, nvlist_t **config);
 extern int spa_get_stats(const char *pool, nvlist_t **config, char *altroot,
     size_t buflen);
-extern int spa_create(const char *pool, nvlist_t *config, nvlist_t *props,
-    nvlist_t *zplprops);
+extern int spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
+    nvlist_t *zplprops, struct dsl_crypto_params *dcp);
 extern int spa_import_rootpool(char *devpath, char *devid);
 extern int spa_import(char *pool, nvlist_t *config, nvlist_t *props,
     uint64_t flags);

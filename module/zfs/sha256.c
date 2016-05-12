@@ -97,7 +97,8 @@ SHA256Transform(uint32_t *H, const uint8_t *cp)
 }
 
 void
-zio_checksum_SHA256(const void *buf, uint64_t size, zio_cksum_t *zcp)
+zio_checksum_SHA256_common(const void *buf, uint64_t size, zio_cksum_t *zcp,
+	boolean_t truncate)
 {
 	uint32_t H[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
 	    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
@@ -119,9 +120,25 @@ zio_checksum_SHA256(const void *buf, uint64_t size, zio_cksum_t *zcp)
 	for (i = 0; i < padsize; i += 64)
 		SHA256Transform(H, pad + i);
 
-	ZIO_SET_CHECKSUM(zcp,
-	    (uint64_t)H[0] << 32 | H[1],
-	    (uint64_t)H[2] << 32 | H[3],
-	    (uint64_t)H[4] << 32 | H[5],
-	    (uint64_t)H[6] << 32 | H[7]);
+	zcp->zc_word[0] = (uint64_t)H[0] << 32 | H[1];
+	zcp->zc_word[1] = (uint64_t)H[2] << 32 | H[3];
+	if (!truncate) {
+		zcp->zc_word[2] = (uint64_t)H[4] << 32 | H[5];
+		zcp->zc_word[3] = (uint64_t)H[6] << 32 | H[7];
+	}
+}
+
+void
+zio_checksum_SHA256(const void *buf, uint64_t size, zio_cksum_t *zcp)
+{
+	zio_checksum_SHA256_common(buf, size, zcp, B_FALSE);
+}
+
+/*
+ * Same as zio_checksum_SHA256, but truncates to allow 96 bits for MAC
+ */
+void
+zio_checksum_SHAMAC(const void *buf, uint64_t size, zio_cksum_t *zcp)
+{
+	zio_checksum_SHA256_common(buf, size, zcp, B_TRUE);
 }

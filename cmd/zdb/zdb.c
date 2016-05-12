@@ -59,6 +59,7 @@
 #include <sys/arc.h>
 #include <sys/ddt.h>
 #include <sys/zfeature.h>
+#include <sys/dsl_keychain.h>
 #include <zfs_comutil.h>
 #include <libzfs.h>
 
@@ -384,11 +385,20 @@ dump_zap(objset_t *os, uint64_t object, void *data, size_t size)
 	for (zap_cursor_init(&zc, os, object);
 	    zap_cursor_retrieve(&zc, &attr) == 0;
 	    zap_cursor_advance(&zc)) {
+		if (attr.za_binary_key) {
+			(void) printf("\t\t[binary key] = [%llu bytes]\n",
+			    (u_longlong_t)(attr.za_num_integers *
+			    attr.za_integer_length));
+			continue;
+		}
+
 		(void) printf("\t\t%s = ", attr.za_name);
+
 		if (attr.za_num_integers == 0) {
 			(void) printf("\n");
 			continue;
 		}
+
 		prop = umem_zalloc(attr.za_num_integers *
 		    attr.za_integer_length, UMEM_NOFAIL);
 		(void) zap_lookup(os, object, attr.za_name,
@@ -2287,7 +2297,7 @@ dump_one_dir(const char *dsname, void *arg)
 	objset_t *os;
 	spa_feature_t f;
 
-	error = dmu_objset_own(dsname, DMU_OST_ANY, B_TRUE, FTAG, &os);
+	error = dmu_objset_own(dsname, DMU_OST_ANY, B_TRUE, B_FALSE, FTAG, &os);
 	if (error) {
 		(void) printf("Could not open %s, error %d\n", dsname, error);
 		return (0);
@@ -2735,7 +2745,8 @@ dump_block_stats(spa_t *spa)
 	zdb_cb_t zcb;
 	zdb_blkstats_t *zb, *tzb;
 	uint64_t norm_alloc, norm_space, total_alloc, total_found;
-	int flags = TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA | TRAVERSE_HARD;
+	int flags = TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA |
+	    TRAVERSE_NO_DECRYPT | TRAVERSE_HARD;
 	boolean_t leaks = B_FALSE;
 	int e, c;
 	bp_embedded_type_t i;
@@ -3040,8 +3051,8 @@ dump_simulated_ddt(spa_t *spa)
 
 	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
 
-	(void) traverse_pool(spa, 0, TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA,
-	    zdb_ddt_add_cb, &t);
+	(void) traverse_pool(spa, 0, TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA |
+	    TRAVERSE_NO_DECRYPT, zdb_ddt_add_cb, &t);
 
 	spa_config_exit(spa, SCL_CONFIG, FTAG);
 
@@ -3846,7 +3857,7 @@ main(int argc, char **argv)
 			}
 		} else {
 			error = dmu_objset_own(target, DMU_OST_ANY,
-			    B_TRUE, FTAG, &os);
+			    B_TRUE, B_FALSE, FTAG, &os);
 		}
 	}
 	nvlist_free(policy);

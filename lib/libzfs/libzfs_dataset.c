@@ -3206,9 +3206,11 @@ zfs_create(libzfs_handle_t *hdl, const char *path, zfs_type_t type,
 	int ret;
 	uint64_t size = 0;
 	uint64_t blocksize = zfs_prop_default_numeric(ZFS_PROP_VOLBLOCKSIZE);
-	char errbuf[1024];
 	uint64_t zoned;
 	dmu_objset_type_t ost;
+	nvlist_t *hidden_args = NULL;
+	char errbuf[1024];
+	char parent[ZFS_MAX_DATASET_NAME_LEN];
 
 	(void) snprintf(errbuf, sizeof (errbuf), dgettext(TEXT_DOMAIN,
 	    "cannot create '%s'"), path);
@@ -3303,15 +3305,19 @@ zfs_create(libzfs_handle_t *hdl, const char *path, zfs_type_t type,
 		}
 	}
 
+	(void) parent_name(path, parent, sizeof (parent));
+	if (zfs_crypto_create(hdl, parent, props, NULL, &hidden_args) != 0) {
+		nvlist_free(props);
+		return (zfs_error(hdl, EZFS_CRYPTOFAILED, errbuf));
+	}
+
 	/* create the dataset */
-	ret = lzc_create(path, ost, props);
+	ret = lzc_create(path, ost, props, hidden_args);
 	nvlist_free(props);
+	nvlist_free(hidden_args);
 
 	/* check for failure */
 	if (ret != 0) {
-		char parent[ZFS_MAX_DATASET_NAME_LEN];
-		(void) parent_name(path, parent, sizeof (parent));
-
 		switch (errno) {
 		case ENOENT:
 			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
@@ -3488,11 +3494,13 @@ zfs_destroy_snaps_nvl(libzfs_handle_t *hdl, nvlist_t *snaps, boolean_t defer)
  * Clones the given dataset.  The target must be of the same type as the source.
  */
 int
-zfs_clone(zfs_handle_t *zhp, const char *target, nvlist_t *props)
+zfs_clone(zfs_handle_t *zhp, const char *target, nvlist_t *props,
+	boolean_t add_key)
 {
 	char parent[ZFS_MAX_DATASET_NAME_LEN];
 	int ret;
 	char errbuf[1024];
+	nvlist_t *hidden_args = NULL;
 	libzfs_handle_t *hdl = zhp->zfs_hdl;
 	uint64_t zoned;
 
@@ -3525,8 +3533,14 @@ zfs_clone(zfs_handle_t *zhp, const char *target, nvlist_t *props)
 			return (-1);
 	}
 
-	ret = lzc_clone(target, zhp->zfs_name, props);
+	if (zfs_crypto_clone(hdl, zhp, parent, add_key, props,
+	    &hidden_args) != 0) {
+		return (zfs_error(hdl, EZFS_CRYPTOFAILED, errbuf));
+	}
+
+	ret = lzc_clone(target, zhp->zfs_name, props, hidden_args);
 	nvlist_free(props);
+	nvlist_free(hidden_args);
 
 	if (ret != 0) {
 		switch (errno) {

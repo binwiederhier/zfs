@@ -621,8 +621,7 @@ sha2_digest_atomic(crypto_provider_handle_t provider,
 		return (ret);
 	}
 
-	if (mechanism->cm_type <= SHA256_HMAC_GEN_MECH_INFO_TYPE)
-		sha_digest_len = SHA256_DIGEST_LENGTH;
+	sha_digest_len = SHA256_DIGEST_LENGTH;
 
 	/*
 	 * Do a SHA2 final, must be done separately since the digest
@@ -684,10 +683,8 @@ sha2_mac_init_ctx(sha2_hmac_ctx_t *ctx, void *keyval, uint_t length_in_bytes)
 	int i, block_size, blocks_per_int64;
 
 	/* Determine the block size */
-	if (ctx->hc_mech_type <= SHA256_HMAC_GEN_MECH_INFO_TYPE) {
-		block_size = SHA256_HMAC_BLOCK_SIZE;
-		blocks_per_int64 = SHA256_HMAC_BLOCK_SIZE / sizeof (uint64_t);
-	}
+	block_size = SHA256_HMAC_BLOCK_SIZE;
+	blocks_per_int64 = SHA256_HMAC_BLOCK_SIZE / sizeof (uint64_t);
 
 	(void) bzero(ipad, block_size);
 	(void) bzero(opad, block_size);
@@ -828,7 +825,7 @@ sha2_mac_final(crypto_ctx_t *ctx, crypto_data_t *mac, crypto_req_handle_t req)
 {
 	int ret = CRYPTO_SUCCESS;
 	uchar_t digest[SHA256_DIGEST_LENGTH];
-	uint32_t digest_len = 0, sha_digest_len = 0;
+	uint32_t digest_len, sha_digest_len;
 
 	ASSERT(ctx->cc_provider_private != NULL);
 
@@ -842,7 +839,7 @@ sha2_mac_final(crypto_ctx_t *ctx, crypto_data_t *mac, crypto_req_handle_t req)
 		digest_len = PROV_SHA2_HMAC_CTX(ctx)->hc_digest_len;
 		break;
 	default:
-		break;
+		return (CRYPTO_MECHANISM_INVALID);
 	}
 
 	/*

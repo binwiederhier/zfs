@@ -148,6 +148,7 @@
 #include <sys/callb.h>
 #include <sys/kstat.h>
 #include <sys/dmu_tx.h>
+#include <sys/zio_crypt.h>
 #include <zfs_fletcher.h>
 #include <sys/arc_impl.h>
 #include <sys/trace_arc.h>
@@ -648,7 +649,8 @@ static arc_state_t	*arc_l2c_only;
 #define	arc_sys_free	ARCSTAT(arcstat_sys_free) /* target system free bytes */
 
 #define	L2ARC_IS_VALID_COMPRESS(_c_) \
-	((_c_) == ZIO_COMPRESS_LZ4 || (_c_) == ZIO_COMPRESS_EMPTY)
+	(((_c_) & L2TRANS_COMP_MASK) == ZIO_COMPRESS_LZ4 || \
+	((_c_) & L2TRANS_COMP_MASK) == ZIO_COMPRESS_EMPTY)
 
 static list_t arc_prune_list;
 static kmutex_t arc_prune_mtx;
@@ -675,6 +677,7 @@ static arc_buf_hdr_t arc_eviction_hdr;
 #define	HDR_L2_WRITING(hdr)	((hdr)->b_flags & ARC_FLAG_L2_WRITING)
 #define	HDR_L2_EVICTED(hdr)	((hdr)->b_flags & ARC_FLAG_L2_EVICTED)
 #define	HDR_L2_WRITE_HEAD(hdr)	((hdr)->b_flags & ARC_FLAG_L2_WRITE_HEAD)
+#define	HDR_L2_ENCRYPT(hdr)	((hdr)->b_flags & ARC_FLAG_L2_ENCRYPT)
 
 #define	HDR_ISTYPE_METADATA(hdr)	\
 	    ((hdr)->b_flags & ARC_FLAG_BUFC_METADATA)
@@ -776,6 +779,7 @@ static list_t L2ARC_free_on_write;		/* free after write buf list */
 static list_t *l2arc_free_on_write;		/* free after write list ptr */
 static kmutex_t l2arc_free_on_write_mtx;	/* mutex for list */
 static uint64_t l2arc_ndev;			/* number of devices */
+static l2arc_crypt_key_t l2arc_crypto_key;	/* global encryption key */
 
 typedef struct l2arc_read_callback {
 	arc_buf_t		*l2rcb_buf;		/* read buffer */
@@ -783,7 +787,7 @@ typedef struct l2arc_read_callback {
 	blkptr_t		l2rcb_bp;		/* original blkptr */
 	zbookmark_phys_t	l2rcb_zb;		/* original bookmark */
 	int			l2rcb_flags;		/* original flags */
-	enum zio_compress	l2rcb_compress;		/* applied compress */
+	uint8_t			l2rcb_transforms;	/* applied comp / enc */
 } l2arc_read_callback_t;
 
 typedef struct l2arc_data_free {
@@ -812,6 +816,9 @@ static void l2arc_read_done(zio_t *);
 
 static boolean_t l2arc_compress_buf(arc_buf_hdr_t *);
 static void l2arc_decompress_zio(zio_t *, arc_buf_hdr_t *, enum zio_compress);
+static int l2arc_encrypt_buf(l2arc_crypt_key_t *, arc_buf_hdr_t *);
+static void l2arc_decrypt_zio(l2arc_crypt_key_t *, zio_t *, arc_buf_hdr_t *);
+
 static void l2arc_release_cdata_buf(arc_buf_hdr_t *);
 
 static uint64_t
@@ -1488,7 +1495,7 @@ arc_buf_info(arc_buf_t *ab, arc_buf_info_t *abi, int state_index)
 	if (l2hdr) {
 		abi->abi_l2arc_dattr = l2hdr->b_daddr;
 		abi->abi_l2arc_asize = l2hdr->b_asize;
-		abi->abi_l2arc_compress = l2hdr->b_compress;
+		abi->abi_l2arc_compress = L2TRANS_GET_COMP(l2hdr->b_transforms);
 		abi->abi_l2arc_hits = l2hdr->b_hits;
 	}
 
@@ -1959,7 +1966,8 @@ arc_buf_l2_cdata_free(arc_buf_hdr_t *hdr)
 	 * separately compressed buffer, so there's nothing to free (it
 	 * points to the same buffer as the arc_buf_t's b_data field).
 	 */
-	if (hdr->b_l2hdr.b_compress == ZIO_COMPRESS_OFF) {
+	if (L2TRANS_GET_COMP(hdr->b_l2hdr.b_transforms) == ZIO_COMPRESS_OFF &&
+	    !L2TRANS_GET_ENC(hdr->b_l2hdr.b_transforms)) {
 		hdr->b_l1hdr.b_tmp_cdata = NULL;
 		return;
 	}
@@ -1968,12 +1976,17 @@ arc_buf_l2_cdata_free(arc_buf_hdr_t *hdr)
 	 * There's nothing to free since the buffer was all zero's and
 	 * compressed to a zero length buffer.
 	 */
-	if (hdr->b_l2hdr.b_compress == ZIO_COMPRESS_EMPTY) {
+	if (L2TRANS_GET_COMP(hdr->b_l2hdr.b_transforms) == ZIO_COMPRESS_EMPTY &&
+	    !L2TRANS_GET_ENC(hdr->b_l2hdr.b_transforms)) {
 		ASSERT3P(hdr->b_l1hdr.b_tmp_cdata, ==, NULL);
 		return;
 	}
 
-	ASSERT(L2ARC_IS_VALID_COMPRESS(hdr->b_l2hdr.b_compress));
+	ASSERT(L2TRANS_GET_COMP(hdr->b_l2hdr.b_transforms) !=
+	    ZIO_COMPRESS_EMPTY);
+
+	ASSERT(L2ARC_IS_VALID_COMPRESS(hdr->b_l2hdr.b_transforms) ||
+	    L2TRANS_GET_ENC(hdr->b_l2hdr.b_transforms));
 
 	arc_buf_free_on_write(hdr->b_l1hdr.b_tmp_cdata,
 	    hdr->b_size, zio_data_buf_free);
@@ -4353,6 +4366,8 @@ top:
 			hdr->b_flags |= ARC_FLAG_L2CACHE;
 		if (*arc_flags & ARC_FLAG_L2COMPRESS)
 			hdr->b_flags |= ARC_FLAG_L2COMPRESS;
+		if (BP_IS_ENCRYPTED(bp))
+			hdr->b_flags |= ARC_FLAG_L2_ENCRYPT;
 		mutex_exit(hash_lock);
 		ARCSTAT_BUMP(arcstat_hits);
 		ARCSTAT_CONDSTAT(!HDR_PREFETCH(hdr),
@@ -4367,7 +4382,7 @@ top:
 		vdev_t *vd = NULL;
 		uint64_t addr = 0;
 		boolean_t devw = B_FALSE;
-		enum zio_compress b_compress = ZIO_COMPRESS_OFF;
+		uint8_t b_transforms = ZIO_COMPRESS_OFF;
 		int32_t b_asize = 0;
 
 		/*
@@ -4415,6 +4430,8 @@ top:
 				hdr->b_flags |= ARC_FLAG_L2COMPRESS;
 			if (BP_GET_LEVEL(bp) > 0)
 				hdr->b_flags |= ARC_FLAG_INDIRECT;
+			if (BP_IS_ENCRYPTED(bp))
+				hdr->b_flags |= ARC_FLAG_L2_ENCRYPT;
 		} else {
 			/*
 			 * This block is in the ghost cache. If it was L2-only
@@ -4442,6 +4459,8 @@ top:
 				hdr->b_flags |= ARC_FLAG_L2CACHE;
 			if (*arc_flags & ARC_FLAG_L2COMPRESS)
 				hdr->b_flags |= ARC_FLAG_L2COMPRESS;
+			if (BP_IS_ENCRYPTED(bp))
+				hdr->b_flags |= ARC_FLAG_L2_ENCRYPT;
 			buf = kmem_cache_alloc(buf_cache, KM_PUSHPAGE);
 			buf->b_hdr = hdr;
 			buf->b_data = NULL;
@@ -4471,7 +4490,7 @@ top:
 		    (vd = hdr->b_l2hdr.b_dev->l2ad_vdev) != NULL) {
 			devw = hdr->b_l2hdr.b_dev->l2ad_writing;
 			addr = hdr->b_l2hdr.b_daddr;
-			b_compress = hdr->b_l2hdr.b_compress;
+			b_transforms = hdr->b_l2hdr.b_transforms;
 			b_asize = hdr->b_l2hdr.b_asize;
 			/*
 			 * Lock out device removal.
@@ -4527,7 +4546,7 @@ top:
 				cb->l2rcb_bp = *bp;
 				cb->l2rcb_zb = *zb;
 				cb->l2rcb_flags = zio_flags;
-				cb->l2rcb_compress = b_compress;
+				cb->l2rcb_transforms = b_transforms;
 
 				ASSERT(addr >= VDEV_LABEL_START_SIZE &&
 				    addr + size < vd->vdev_psize -
@@ -4539,7 +4558,7 @@ top:
 				 * Issue a null zio if the underlying buffer
 				 * was squashed to zero size by compression.
 				 */
-				if (b_compress == ZIO_COMPRESS_EMPTY) {
+				if (b_transforms == ZIO_COMPRESS_EMPTY) {
 					rzio = zio_null(pio, spa, vd,
 					    l2arc_read_done, cb,
 					    zio_flags | ZIO_FLAG_DONT_CACHE |
@@ -5109,6 +5128,8 @@ arc_write(zio_t *pio, spa_t *spa, uint64_t txg,
 		hdr->b_flags |= ARC_FLAG_L2CACHE;
 	if (l2arc_compress)
 		hdr->b_flags |= ARC_FLAG_L2COMPRESS;
+	if (BP_IS_ENCRYPTED(bp))
+		hdr->b_flags |= ARC_FLAG_L2_ENCRYPT;
 	callback = kmem_zalloc(sizeof (arc_write_callback_t), KM_SLEEP);
 	callback->awcb_ready = ready;
 	callback->awcb_children_ready = children_ready;
@@ -6123,10 +6144,19 @@ l2arc_read_done(zio_t *zio)
 	ASSERT3P(hash_lock, ==, HDR_LOCK(hdr));
 
 	/*
-	 * If the buffer was compressed, decompress it first.
+	 * If the buffer was encrypted, decrypt it.
 	 */
-	if (cb->l2rcb_compress != ZIO_COMPRESS_OFF)
-		l2arc_decompress_zio(zio, hdr, cb->l2rcb_compress);
+	if (L2TRANS_GET_ENC(cb->l2rcb_transforms))
+		l2arc_decrypt_zio(&l2arc_crypto_key, zio, hdr);
+
+	/*
+	 * If the buffer was compressed, decompress it.
+	 */
+	if (L2TRANS_GET_COMP(cb->l2rcb_transforms) != ZIO_COMPRESS_OFF) {
+		l2arc_decompress_zio(zio, hdr,
+		    L2TRANS_GET_COMP(cb->l2rcb_transforms));
+	}
+
 	ASSERT(zio->io_data != NULL);
 	ASSERT3U(zio->io_size, ==, hdr->b_size);
 	ASSERT3U(BP_GET_LSIZE(&cb->l2rcb_bp), ==, hdr->b_size);
@@ -6474,7 +6504,7 @@ l2arc_write_buffers(spa_t *spa, l2arc_dev_t *dev, uint64_t target_sz,
 			 * can't access without holding the ARC list locks
 			 * (which we want to avoid during compression/writing)
 			 */
-			hdr->b_l2hdr.b_compress = ZIO_COMPRESS_OFF;
+			hdr->b_l2hdr.b_transforms = ZIO_COMPRESS_OFF;
 			hdr->b_l2hdr.b_asize = hdr->b_size;
 			hdr->b_l2hdr.b_hits = 0;
 			hdr->b_l1hdr.b_tmp_cdata = hdr->b_l1hdr.b_buf->b_data;
@@ -6586,6 +6616,9 @@ l2arc_write_buffers(spa_t *spa, l2arc_dev_t *dev, uint64_t target_sz,
 			}
 		}
 
+		if (HDR_L2_ENCRYPT(hdr) && hdr->b_l2hdr.b_asize != 0)
+			VERIFY0(l2arc_encrypt_buf(&l2arc_crypto_key, hdr));
+
 		/*
 		 * Pick up the buffer data we had previously stashed away
 		 * (and now potentially also compressed).
@@ -6671,7 +6704,7 @@ l2arc_write_buffers(spa_t *spa, l2arc_dev_t *dev, uint64_t target_sz,
  *    set to zero and b_compress is set to ZIO_COMPRESS_EMPTY.
  * *) Compression succeeded and b_tmp_cdata was replaced with a temporary
  *    data buffer which holds the compressed data to be written, and b_asize
- *    tells us how much data there is. b_compress is set to the appropriate
+ *    tells us how much data there is. b_transforms is set with the appropriate
  *    compression algorithm. Once writing is done, invoke
  *    l2arc_release_cdata_buf on this l2hdr to free this temporary buffer.
  *
@@ -6690,7 +6723,7 @@ l2arc_compress_buf(arc_buf_hdr_t *hdr)
 	l2hdr = &hdr->b_l2hdr;
 
 	ASSERT(HDR_HAS_L1HDR(hdr));
-	ASSERT3U(l2hdr->b_compress, ==, ZIO_COMPRESS_OFF);
+	ASSERT3U(L2TRANS_GET_COMP(l2hdr->b_transforms), ==, ZIO_COMPRESS_OFF);
 	ASSERT(hdr->b_l1hdr.b_tmp_cdata != NULL);
 
 	len = l2hdr->b_asize;
@@ -6708,7 +6741,7 @@ l2arc_compress_buf(arc_buf_hdr_t *hdr)
 	if (csize == 0) {
 		/* zero block, indicate that there's nothing to write */
 		zio_data_buf_free(cdata, len);
-		l2hdr->b_compress = ZIO_COMPRESS_EMPTY;
+		L2TRANS_SET_COMP(l2hdr->b_transforms, ZIO_COMPRESS_EMPTY);
 		l2hdr->b_asize = 0;
 		hdr->b_l1hdr.b_tmp_cdata = NULL;
 		ARCSTAT_BUMP(arcstat_l2_compress_zeros);
@@ -6718,7 +6751,7 @@ l2arc_compress_buf(arc_buf_hdr_t *hdr)
 		 * Compression succeeded, we'll keep the cdata around for
 		 * writing and release it afterwards.
 		 */
-		l2hdr->b_compress = ZIO_COMPRESS_LZ4;
+		L2TRANS_SET_COMP(l2hdr->b_transforms, ZIO_COMPRESS_LZ4);
 		l2hdr->b_asize = csize;
 		hdr->b_l1hdr.b_tmp_cdata = cdata;
 		ARCSTAT_BUMP(arcstat_l2_compress_successes);
@@ -6796,6 +6829,136 @@ l2arc_decompress_zio(zio_t *zio, arc_buf_hdr_t *hdr, enum zio_compress c)
 	zio->io_orig_size = zio->io_size = hdr->b_size;
 }
 
+static int
+l2arc_encrypt_buf(l2arc_crypt_key_t *key, arc_buf_hdr_t *hdr)
+{
+	int ret;
+	uio_t puio, cuio;
+	iovec_t plain_iov;
+	iovec_t cipher_iovs[2];
+	uint8_t ivbuf[L2ARC_IV_LEN];
+	uint_t datalen = hdr->b_l2hdr.b_asize;
+	uint_t bufsize = hdr->b_size;
+	void *crypt_buf = NULL;
+
+	ASSERT(L2TRANS_GET_COMP(hdr->b_l2hdr.b_transforms) !=
+	    ZIO_COMPRESS_EMPTY);
+
+	crypt_buf = zio_data_buf_alloc(bufsize);
+
+	plain_iov.iov_base = hdr->b_l1hdr.b_tmp_cdata;
+	plain_iov.iov_len = datalen;
+	cipher_iovs[0].iov_base = crypt_buf;
+	cipher_iovs[0].iov_len = datalen;
+	cipher_iovs[1].iov_base = hdr->b_l2hdr.b_mac;
+	cipher_iovs[1].iov_len = L2ARC_MAC_LEN;
+
+	puio.uio_iov = &plain_iov;
+	puio.uio_iovcnt = 1;
+	cuio.uio_iov = cipher_iovs;
+	cuio.uio_iovcnt = 2;
+
+#ifdef _KERNEL
+	puio.uio_segflg = UIO_SYSSPACE;
+	cuio.uio_segflg = UIO_SYSSPACE;
+#else
+	puio.uio_segflg = UIO_USERSPACE;
+	cuio.uio_segflg = UIO_USERSPACE;
+#endif
+
+	ret = zio_crypt_generate_iv_l2arc(hdr->b_spa, &hdr->b_dva,
+	    hdr->b_birth, hdr->b_l2hdr.b_daddr, ivbuf);
+	if (ret)
+		goto error;
+
+	ret = zio_encrypt_uio(key->l2ck_crypt, &key->l2ck_key,
+	    key->l2ck_ctx_tmpl, ivbuf, datalen, &puio, &cuio);
+	if (ret)
+		goto error;
+
+	/*
+	 * if the data was compressed before we encrypted it, the buffer will
+	 * have a separately allocated buffer for the compressed data. We need
+	 * to free this and replace it with our own buffer, which (for freeing
+	 * purposes) must be the same size.
+	 */
+
+	if (L2TRANS_GET_COMP(hdr->b_l2hdr.b_transforms) != ZIO_COMPRESS_OFF) {
+		ASSERT3U(L2TRANS_GET_COMP(hdr->b_l2hdr.b_transforms), ==,
+		    ZIO_COMPRESS_LZ4);
+		zio_data_buf_free(hdr->b_l1hdr.b_tmp_cdata, bufsize);
+	}
+
+	hdr->b_l1hdr.b_tmp_cdata = crypt_buf;
+	L2TRANS_SET_ENC(hdr->b_l2hdr.b_transforms, B_TRUE);
+
+	return (0);
+
+error:
+	if (crypt_buf)
+		zio_data_buf_free(crypt_buf, bufsize);
+	return (ret);
+}
+
+static void
+l2arc_decrypt_zio(l2arc_crypt_key_t *key, zio_t *zio, arc_buf_hdr_t *hdr) {
+	int ret;
+	uio_t puio, cuio;
+	iovec_t plain_iovs[2];
+	iovec_t cipher_iovs[2];
+	uint8_t ivbuf[L2ARC_IV_LEN];
+	uint8_t outmac[L2ARC_MAC_LEN];
+	uint_t datalen = zio->io_size;
+	void *crypt_buf = NULL;
+
+	if (zio->io_error != 0)
+		return;
+
+	crypt_buf = zio_data_buf_alloc(datalen);
+	bcopy(zio->io_data, crypt_buf, datalen);
+
+	plain_iovs[0].iov_base = zio->io_data;
+	plain_iovs[0].iov_len = datalen;
+	plain_iovs[1].iov_base = outmac;
+	plain_iovs[1].iov_len = L2ARC_MAC_LEN;
+	cipher_iovs[0].iov_base = crypt_buf;
+	cipher_iovs[0].iov_len = datalen;
+	cipher_iovs[1].iov_base = hdr->b_l2hdr.b_mac;
+	cipher_iovs[1].iov_len = L2ARC_MAC_LEN;
+
+	puio.uio_iov = plain_iovs;
+	puio.uio_iovcnt = 2;
+	cuio.uio_iov = cipher_iovs;
+	cuio.uio_iovcnt = 2;
+
+#ifdef _KERNEL
+	puio.uio_segflg = UIO_SYSSPACE;
+	cuio.uio_segflg = UIO_SYSSPACE;
+#else
+	puio.uio_segflg = UIO_USERSPACE;
+	cuio.uio_segflg = UIO_USERSPACE;
+#endif
+
+	ret = zio_crypt_generate_iv_l2arc(hdr->b_spa, &hdr->b_dva,
+	    hdr->b_birth, hdr->b_l2hdr.b_daddr, ivbuf);
+	if (ret)
+		goto error;
+
+	ret = zio_decrypt_uio(key->l2ck_crypt, &key->l2ck_key,
+	    key->l2ck_ctx_tmpl, ivbuf, datalen, &puio, &cuio);
+	if (ret)
+		goto error;
+
+	zio_data_buf_free(crypt_buf, datalen);
+
+	return;
+
+error:
+	if (crypt_buf)
+		zio_data_buf_free(crypt_buf, datalen);
+	zio->io_error = EIO;
+}
+
 /*
  * Releases the temporary b_tmp_cdata buffer in an l2arc header structure.
  * This buffer serves as a temporary holder of compressed data while
@@ -6806,20 +6969,22 @@ static void
 l2arc_release_cdata_buf(arc_buf_hdr_t *hdr)
 {
 	enum zio_compress comp;
+	boolean_t encrypted;
 
 	ASSERT(HDR_HAS_L1HDR(hdr));
 	ASSERT(HDR_HAS_L2HDR(hdr));
-	comp = hdr->b_l2hdr.b_compress;
+	comp = L2TRANS_GET_COMP(hdr->b_l2hdr.b_transforms);
+	encrypted = L2TRANS_GET_ENC(hdr->b_l2hdr.b_transforms);
 	ASSERT(comp == ZIO_COMPRESS_OFF || L2ARC_IS_VALID_COMPRESS(comp));
 
-	if (comp == ZIO_COMPRESS_OFF) {
+	if (comp == ZIO_COMPRESS_OFF && !encrypted) {
 		/*
 		 * In this case, b_tmp_cdata points to the same buffer
 		 * as the arc_buf_t's b_data field. We don't want to
 		 * free it, since the arc_buf_t will handle that.
 		 */
 		hdr->b_l1hdr.b_tmp_cdata = NULL;
-	} else if (comp == ZIO_COMPRESS_EMPTY) {
+	} else if (comp == ZIO_COMPRESS_EMPTY && !encrypted) {
 		/*
 		 * In this case, b_tmp_cdata was compressed to an empty
 		 * buffer, thus there's nothing to free and b_tmp_cdata
@@ -6828,12 +6993,13 @@ l2arc_release_cdata_buf(arc_buf_hdr_t *hdr)
 		ASSERT3P(hdr->b_l1hdr.b_tmp_cdata, ==, NULL);
 	} else {
 		/*
-		 * If the data was compressed, then we've allocated a
-		 * temporary buffer for it, so now we need to release it.
+		 * If the data was compressed or encrypted, then we've allocated
+		 * a temporary buffer for it, so now we need to release it.
 		 */
 		ASSERT(hdr->b_l1hdr.b_tmp_cdata != NULL);
-		zio_data_buf_free(hdr->b_l1hdr.b_tmp_cdata,
-		    hdr->b_size);
+		ASSERT(comp == ZIO_COMPRESS_LZ4 || encrypted);
+
+		zio_data_buf_free(hdr->b_l1hdr.b_tmp_cdata, hdr->b_size);
 		hdr->b_l1hdr.b_tmp_cdata = NULL;
 	}
 
@@ -7052,6 +7218,8 @@ l2arc_init(void)
 	mutex_init(&l2arc_dev_mtx, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&l2arc_free_on_write_mtx, NULL, MUTEX_DEFAULT, NULL);
 
+	(void) l2arc_crypt_key_init(&l2arc_crypto_key);
+
 	l2arc_dev_list = &L2ARC_dev_list;
 	l2arc_free_on_write = &L2ARC_free_on_write;
 	list_create(l2arc_dev_list, sizeof (l2arc_dev_t),
@@ -7075,6 +7243,8 @@ l2arc_fini(void)
 	cv_destroy(&l2arc_feed_thr_cv);
 	mutex_destroy(&l2arc_dev_mtx);
 	mutex_destroy(&l2arc_free_on_write_mtx);
+
+	l2arc_crypt_key_destroy(&l2arc_crypto_key);
 
 	list_destroy(l2arc_dev_list);
 	list_destroy(l2arc_free_on_write);

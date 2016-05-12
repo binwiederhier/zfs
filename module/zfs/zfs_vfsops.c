@@ -672,7 +672,7 @@ zfs_sb_create(const char *osname, zfs_mntopts_t *zmo, zfs_sb_t **zsbp)
 	 * We claim to always be readonly so we can open snapshots;
 	 * other ZPL code will prevent us from writing to snapshots.
 	 */
-	error = dmu_objset_own(osname, DMU_OST_ZFS, B_TRUE, zsb, &os);
+	error = dmu_objset_own(osname, DMU_OST_ZFS, B_TRUE, B_TRUE, zsb, &os);
 	if (error) {
 		kmem_free(zsb, sizeof (zfs_sb_t));
 		return (error);
