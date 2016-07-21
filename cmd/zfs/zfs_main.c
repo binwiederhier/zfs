@@ -3727,7 +3727,7 @@ zfs_do_send(int argc, char **argv)
 	boolean_t extraverbose = B_FALSE;
 
 	/* check options */
-	while ((c = getopt(argc, argv, ":i:I:RDpvnPLet:")) != -1) {
+	while ((c = getopt(argc, argv, ":i:I:RDpvnPLert:")) != -1) {
 		switch (c) {
 		case 'i':
 			if (fromname)
@@ -3767,6 +3767,9 @@ zfs_do_send(int argc, char **argv)
 			break;
 		case 'e':
 			flags.embed_data = B_TRUE;
+			break;
+		case 'r':
+			flags.raw = B_TRUE;
 			break;
 		case 't':
 			resume_token = optarg;

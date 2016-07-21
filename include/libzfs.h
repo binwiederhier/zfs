@@ -644,6 +644,9 @@ typedef struct sendflags {
 
 	/* WRITE_EMBEDDED records of type DATA are permitted */
 	boolean_t embed_data;
+
+	/* Data sent will be compressed / encrypted (ie. -r) */
+	boolean_t raw;
 } sendflags_t;
 
 typedef boolean_t (snapfilter_cb_t)(zfs_handle_t *, void *);
